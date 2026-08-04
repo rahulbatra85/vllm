@@ -1209,6 +1209,16 @@ ROCM_BACKEND_CONFIGS = {
         "requires_aiter": True,
         "requires_gfx950": True,
     },
+    # Opt-in triton a16w4 path (`--moe-backend aiter_triton`). Runs with TP=1,
+    # so `should_use_cdna4_mx_scale_swizzle()` is True here: this also guards
+    # the load-time-swizzle vs `swizzle_mx_scale` kernel-arg agreement.
+    "AITER_MXFP4_BF16_TRITON": {
+        "activation": "SWIGLUOAI",
+        "rtol": 0.3,
+        "percent": 0.95,
+        "requires_aiter": True,
+        "requires_gfx950": True,
+    },
     "AITER_MXFP4_FP8": {
         "activation": "SWIGLUOAI",
         "rtol": 0.5,

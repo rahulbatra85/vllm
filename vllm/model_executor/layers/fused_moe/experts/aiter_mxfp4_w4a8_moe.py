@@ -336,6 +336,7 @@ def _aiter_w4a16_silu_via_a8w4(
     unpadded_K_w1,
     unpadded_N_w2,
     unpadded_K_w2,
+    swz: str | None,
 ) -> torch.Tensor:
     """
     MXFP4 w4a16 MoE with a SILU (concatenated ``[gate | up]``) activation.
@@ -344,11 +345,6 @@ def _aiter_w4a16_silu_via_a8w4(
     from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4
     from aiter.ops.triton.quant import dynamic_mxfp8_quant
 
-    from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-        should_use_cdna4_mx_scale_swizzle,
-    )
-
-    swz = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
     quant_dtype = torch.float8_e4m3fn
 
     g1_gammas = gammas if apply_router_weight_on_input else None
@@ -466,6 +462,16 @@ def aiter_triton_kernel_w4a16_moe_forward(
     assert quant_config.w1_precision is not None
     assert quant_config.w2_precision is not None
 
+    from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+        should_use_cdna4_mx_scale_swizzle,
+    )
+
+    # Must agree with the load-time scale layout picked by `_swizzle_mxfp4`,
+    # or the kernel unpacks swizzled scales as strided and silently returns
+    # wrong numerics. a16w4 always runs BLOCK_K=256, so CDNA4's
+    # BLOCK_K % 256 == 0 constraint always holds.
+    swz = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
+
     w1_data = _aiter_raw(w1)
     w2_data = _aiter_raw(w2)
     w1_wscale = _aiter_raw(quant_config.w1_precision.weight_scale)
@@ -502,6 +508,7 @@ def aiter_triton_kernel_w4a16_moe_forward(
             unpadded_K_w1,
             unpadded_N_w2,
             unpadded_K_w2,
+            swz,
         )
 
     # SILU: silu(gate) * up — same kernel, just no "+1" residual in swiglu.
@@ -518,7 +525,7 @@ def aiter_triton_kernel_w4a16_moe_forward(
         routing_data,
         gather_indx=gather_idx,
         gammas=gammas if apply_router_weight_on_input else None,
-        swizzle_mx_scale=None,
+        swizzle_mx_scale=swz,
         apply_swiglu=True,
         alpha=swiglu_alpha,
         limit=swiglu_limit,
@@ -538,7 +545,7 @@ def aiter_triton_kernel_w4a16_moe_forward(
         routing_data,
         scatter_indx=scatter_idx,
         gammas=None if apply_router_weight_on_input else gammas,
-        swizzle_mx_scale=None,
+        swizzle_mx_scale=swz,
         unpadded_N=unpadded_N_w2,
         unpadded_K=unpadded_K_w2,
     )
@@ -595,6 +602,9 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             not moe_parallel_config.use_all2all_kernels
             and not moe_parallel_config.enable_eplb
             and moe_parallel_config.dp_size <= 1
+            # apply() routes internally over global_num_experts and ignores
+            # expert_map, so only the non-EP case is correct.
+            and moe_parallel_config.ep_size <= 1
         )
 
     @staticmethod
@@ -638,6 +648,10 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
     ) -> torch.Tensor:
         assert self.moe_config.intermediate_size_per_partition_unpadded is not None
         assert self.moe_config.hidden_dim_unpadded is not None
+        assert expert_map is None, (
+            "AiterW4A16ExpertsMonolithic routes internally over all global "
+            "experts and cannot honor an expert_map"
+        )
         score_mode = (
             "sqrtsoftplus"
             if self.moe_config.routing_method == RoutingMethodType.DeepseekV4

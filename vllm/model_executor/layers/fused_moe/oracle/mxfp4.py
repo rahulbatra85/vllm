@@ -113,6 +113,10 @@ class Mxfp4MoeBackend(Enum):
     AITER = "AITER_MXFP4_BF16"
     AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8: triton kernel
     AITER_MXFP4_MXFP4 = "AITER_MXFP4_MXFP4"  # W4A4: CK kernel
+    # W4A16 via the AITER *triton* a16w4 kernel. Opt-in only
+    # (`--moe-backend aiter_triton`); never auto-selected, since
+    # AITER_MXFP4_BF16 (CK) stays the gfx950 default.
+    AITER_MXFP4_BF16_TRITON = "AITER_MXFP4_BF16_TRITON"
     # Triton
     TRITON = "TRITON"
     TRITON_UNFUSED = "TRITON_UNFUSED"
@@ -129,6 +133,7 @@ class Mxfp4MoeBackend(Enum):
 # AITER backends group
 AITER_BACKENDS = (
     Mxfp4MoeBackend.AITER_MXFP4_BF16,
+    Mxfp4MoeBackend.AITER_MXFP4_BF16_TRITON,
     Mxfp4MoeBackend.AITER_MXFP4_FP8,
     Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
 )
@@ -144,6 +149,26 @@ TRITON_BACKENDS = (
     Mxfp4MoeBackend.TRITON,
     Mxfp4MoeBackend.TRITON_UNFUSED,
 )
+
+
+def uses_triton_mxfp4_weight_format(mxfp4_backend: Mxfp4MoeBackend) -> bool:
+    """Whether the backend's weights live in the ``triton_kernels`` layout.
+
+    Such weights are wrapped ``triton_kernels`` tensors plus a
+    ``PrecisionConfig`` holding the swizzled block scales, rather than plain
+    tensors plus a scale tensor. Callers must not ``replace_parameter()`` them,
+    must not set the CK ``is_shuffled`` marker on them, and must read scales
+    via ``quant_config.w1_precision``/``w2_precision``.
+    """
+    if mxfp4_backend in TRITON_BACKENDS + (Mxfp4MoeBackend.AITER_MXFP4_BF16_TRITON,):
+        return True
+    if not current_platform.is_rocm():
+        return False
+    # gfx1250 has no CK a16w4 kernel, so AITER_MXFP4_BF16 falls through to
+    # AiterW4A16ExpertsMonolithic there and needs the triton layout too.
+    from vllm.platforms.rocm import on_gfx1250
+
+    return mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and on_gfx1250()
 
 
 def backend_to_kernel_cls(
@@ -229,7 +254,21 @@ def backend_to_kernel_cls(
             AiterExperts,
         )
 
+        # NOTE: deliberately Modular before Monolithic, unlike the other
+        # backends: AiterExperts._supports_quant_scheme rejects mxfp4 on
+        # gfx1250, so the fall-through picks the monolithic triton kernel there
+        # while gfx950 keeps the CK default. Opt into triton on gfx950 with
+        # `--moe-backend aiter_triton` (AITER_MXFP4_BF16_TRITON). Two call
+        # sites pin index 0 to AiterExperts: the Kimi-K3 SiTU path in
+        # quantization/mxfp4.py and quark/quark_moe.py.
         return [AiterExperts, AiterW4A16ExpertsMonolithic]
+
+    elif backend == Mxfp4MoeBackend.AITER_MXFP4_BF16_TRITON:
+        from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp4_w4a8_moe import (
+            AiterW4A16ExpertsMonolithic,
+        )
+
+        return [AiterW4A16ExpertsMonolithic]
 
     elif backend == Mxfp4MoeBackend.AITER_MXFP4_FP8:
         from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp4_w4a8_moe import (
@@ -293,6 +332,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
             Mxfp4MoeBackend.AITER_MXFP4_FP8,
             Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
         ],
+        "aiter_triton": [Mxfp4MoeBackend.AITER_MXFP4_BF16_TRITON],
         "aiter_mxfp4_fp8": [Mxfp4MoeBackend.AITER_MXFP4_FP8],
         "aiter_mxfp4_mxfp4": [Mxfp4MoeBackend.AITER_MXFP4_MXFP4],
         "xpu": [Mxfp4MoeBackend.XPU],
@@ -1130,7 +1170,10 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
-    elif mxfp4_backend in TRITON_BACKENDS:
+    elif uses_triton_mxfp4_weight_format(mxfp4_backend):
+        # gpt-oss w13 is already gate/up-interleaved, which is what both the
+        # OAI triton kernel and aiter's `moe_gemm_a16w4(apply_swiglu=True)`
+        # read, so no de-interleave or bias permute here.
         from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
         if w13_bias is not None:
@@ -1496,9 +1539,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
-    elif mxfp4_backend in TRITON_BACKENDS or (
-        mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and on_gfx1250()
-    ):
+    elif uses_triton_mxfp4_weight_format(mxfp4_backend):
         from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
         if mxfp4_backend == Mxfp4MoeBackend.TRITON:
@@ -1660,6 +1701,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
+        Mxfp4MoeBackend.AITER_MXFP4_BF16_TRITON,
         Mxfp4MoeBackend.CPU,
     ):
         return mxfp4_w4a16_moe_quant_config(

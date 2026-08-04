@@ -16,7 +16,6 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
-    TRITON_BACKENDS,
     Mxfp4MoeBackend,
     backend_to_kernel_cls,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
@@ -26,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     mxfp4_round_up_hidden_size_and_intermediate_size,
     select_deepseek_v4_mxfp4_moe_backend,
     select_mxfp4_moe_backend,
+    uses_triton_mxfp4_weight_format,
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -349,9 +349,10 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             )
         )
 
-        # For TRITON backends, weights are wrapped tensors from triton_kernels
-        # that don't support .detach(). Manually assign parameters.
-        if self.mxfp4_backend not in TRITON_BACKENDS:
+        # For triton-layout backends, weights are wrapped tensors from
+        # triton_kernels that don't support .detach(). Manually assign.
+        uses_triton_weight_format = uses_triton_mxfp4_weight_format(self.mxfp4_backend)
+        if not uses_triton_weight_format:
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
             replace_parameter(layer, "w13_weight_scale", w13_scale)
@@ -362,8 +363,12 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             self.w13_precision_config = w13_scale
             self.w2_precision_config = w2_scale
 
-        # AITER backend requires weights to be marked as shuffled.
-        if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+        # The AITER CK kernel dispatches on this marker; the triton a16w4
+        # kernel reads the swizzled layout instead.
+        if (
+            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16
+            and not uses_triton_weight_format
+        ):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
@@ -404,8 +409,8 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         w1_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
-        if self.mxfp4_backend in TRITON_BACKENDS:
-            # TRITON backends free w13/w2_weight_scale after swizzling; the
+        if uses_triton_mxfp4_weight_format(self.mxfp4_backend):
+            # These backends free w13/w2_weight_scale after swizzling; the
             # swizzled scales live inside the precision configs instead.
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
@@ -737,13 +742,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         )
 
-        # For TRITON backends, weights are wrapped tensors from triton_kernels
-        # that don't support .detach(). Manually assign parameters.
-        from vllm.platforms.rocm import on_gfx1250
-
-        uses_triton_weight_format = self.mxfp4_backend in TRITON_BACKENDS or (
-            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and on_gfx1250()
-        )
+        # For triton-layout backends, weights are wrapped tensors from
+        # triton_kernels that don't support .detach(). Manually assign.
+        uses_triton_weight_format = uses_triton_mxfp4_weight_format(self.mxfp4_backend)
         if not uses_triton_weight_format:
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
@@ -755,7 +756,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w13_precision_config = w13_scale
             self.w2_precision_config = w2_scale
 
-        # AITER backend requires weights to be marked as shuffled.
+        # The AITER CK kernel requires weights to be marked as shuffled.
         if (
             self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16
             and not uses_triton_weight_format
@@ -853,12 +854,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias = getattr(layer, "w2_bias", None)
         swiglu_limit = getattr(layer, "swiglu_limit", None)
 
-        from vllm.platforms.rocm import on_gfx1250
-
-        if self.mxfp4_backend in TRITON_BACKENDS or (
-            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and on_gfx1250()
-        ):
-            # TRITON backends free w13/w2_weight_scale after swizzling; the
+        if uses_triton_mxfp4_weight_format(self.mxfp4_backend):
+            # These backends free w13/w2_weight_scale after swizzling; the
             # swizzled scales live inside the precision configs instead.
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
