@@ -190,6 +190,12 @@ class AsyncLLM(EngineClient):
         except RuntimeError:
             pass
 
+        # Always bind the attribute: start_profile/stop_profile test it, and
+        # with ignore_frontend=True the branch below never runs, which
+        # otherwise leaves AsyncLLM.profiler undefined (AttributeError on
+        # /start_profile). Honors the constructor arg when one is passed.
+        self.profiler = profiler
+
         if (
             vllm_config.profiler_config.profiler == "torch"
             and not vllm_config.profiler_config.ignore_frontend

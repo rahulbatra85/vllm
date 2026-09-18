@@ -35,6 +35,15 @@ def _warm_fa4_mla_prefill(worker: Worker) -> None:
 
 
 def _warm_inkling_fa4_rel_attention(worker: Worker) -> None:
+    from vllm.platforms import current_platform
+
+    # The FA4 CuTeDSL rel-attention kernel is NVIDIA-only. On ROCm the Inkling
+    # model dispatches to vllm.models.inkling.amd, whose rel-attention is
+    # Triton/Gluon and needs no CuTeDSL warmup; importing the nvidia op here
+    # would pull in vllm.vllm_flash_attn and fail (no _vllm_fa2_C/_vllm_fa3_C).
+    if current_platform.is_rocm():
+        return
+
     from vllm.models.inkling.configs import InklingMMConfig, InklingModelConfig
     from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
         INKLING_FA4_REL_ATTENTION_KERNEL,
