@@ -78,10 +78,42 @@ def _unpack_bf16_pairs(values):
 
 
 @triton.jit
-def _wait_pairs(ptr, offsets, mask):
+def _wait_pairs(
+    ptr,
+    offsets,
+    mask,
+    max_spins,
+    stall_ptr,
+    token,
+    split,
+    PHASE: tl.constexpr,
+    BOUNDED: tl.constexpr,
+):
+    """Spin until every masked pair is published.
+
+    With ``max_spins == 0`` this is the production unbounded spin. With a
+    positive budget it gives up and records what was still missing, so a starved
+    waiter reports itself instead of hanging the stream (and with it every
+    later collective on that stream) forever.
+    """
+    # NOTE: no Python `or` in the loop condition. Short-circuit operators call
+    # bool() on Triton values, which does not mean what it looks like here; the
+    # caller passes a huge budget instead to express "unbounded".
     values = tl.load(ptr + offsets, mask=mask, other=0, volatile=True)
-    while tl.max(tl.where(mask & (values == _EMPTY_PAIR), 1, 0)) != 0:
+    spins = 0
+    while tl.max(tl.where(mask & (values == _EMPTY_PAIR), 1, 0)) != 0 and (
+        spins < max_spins
+    ):
         values = tl.load(ptr + offsets, mask=mask, other=0, volatile=True)
+        spins += 1
+
+    if BOUNDED:
+        pending = tl.sum(tl.where(mask & (values == _EMPTY_PAIR), 1, 0))
+        if pending != 0:
+            tl.atomic_add(stall_ptr + PHASE, 1)
+            tl.atomic_max(stall_ptr + 2, pending)
+            tl.atomic_min(stall_ptr + 3, token)
+            tl.atomic_max(stall_ptr + 4, split)
     return values
 
 
@@ -132,6 +164,8 @@ def _publish_input_kernel(
 def _reduce_insert_kernel(
     input_peer_ptrs,
     input_peer_offset_u32,
+    max_spins,
+    stall_ptr,
     cache_ptr,
     slot_ptr,
     stride_cache_block,
@@ -147,6 +181,7 @@ def _reduce_insert_kernel(
     CACHE_OFFSET: tl.constexpr,
     RANK: tl.constexpr,
     WORLD: tl.constexpr,
+    BOUNDED: tl.constexpr,
     USE_PDL: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
@@ -184,7 +219,22 @@ def _reduce_insert_kernel(
     )
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-    packed = _wait_pairs(input_u32, offsets, mask)
+    packed = _wait_pairs(
+        input_u32,
+        offsets,
+        mask,
+        max_spins,
+        stall_ptr,
+        token.to(tl.int32),
+        split.to(tl.int32),
+        PHASE=0,
+        BOUNDED=BOUNDED,
+    )
+    if BOUNDED:
+        # offsets is [WORLD, pairs]; per-source sums say *whose* partial is
+        # missing, which is the fact the hang otherwise hides.
+        per_source = tl.sum(tl.where(mask & (packed == _EMPTY_PAIR), 1, 0), axis=1)
+        tl.atomic_add(stall_ptr + 8 + tl.arange(0, WORLD), per_source)
 
     lo = (packed & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
     hi = (packed >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
@@ -342,6 +392,8 @@ def _sconv_publish_kernel(
 
 @triton.jit
 def _gather_norm_kernel(
+    max_spins,
+    stall_ptr,
     output_peer_ptrs,
     output_peer_offset_u32,
     norm_weight_ptr,
@@ -353,6 +405,7 @@ def _gather_norm_kernel(
     C_P2: tl.constexpr,
     RANK: tl.constexpr,
     HAS_NORM: tl.constexpr,
+    BOUNDED: tl.constexpr,
     USE_PDL: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
@@ -372,7 +425,17 @@ def _gather_norm_kernel(
         weight = tl.load(norm_weight_ptr + channel, mask=channel_mask, other=0.0)
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-    packed = _wait_pairs(output_u32, offsets, pair_mask)
+    packed = _wait_pairs(
+        output_u32,
+        offsets,
+        pair_mask,
+        max_spins,
+        stall_ptr,
+        token.to(tl.int32),
+        tl.zeros([], tl.int32),
+        PHASE=1,
+        BOUNDED=BOUNDED,
+    )
     row = _unpack_bf16_pairs(packed)
     tl.store(
         residual_out_ptr + token * stride_output_t + channel, row, mask=channel_mask
@@ -499,6 +562,7 @@ class LamportRSConv:
             raise ValueError(f"max_tokens must be in [1, {_MAX_TOKENS}]")
 
         is_cross_node = not all(in_the_same_node_as(tp.cpu_group))
+        assert is_cross_node is False, "Cannot use LamportRSConv on cross_node on ROCm"
         self.hidden_size = hidden_size
         self.window_size = window_size
         self.max_tokens = max_tokens
@@ -508,74 +572,43 @@ class LamportRSConv:
         self.num_buffers = 3
         self.input_generation_bytes = max_tokens * hidden_size * 2
         self.output_generation_bytes = max_tokens * hidden_size * 2
-        self.use_pdl = torch.cuda.get_device_capability(self.device)[0] >= 9
-        if is_cross_node:
-            try:
-                from flashinfer.comm.mnnvl import (
-                    McastGPUBuffer,
-                    TorchDistBackend,
-                    is_mnnvl_fabric_supported,
-                )
-            except ImportError as error:
-                raise RuntimeError(
-                    "cross-node TP requires FlashInfer MNNVL support"
-                ) from error
 
-            local_supported = int(
-                is_mnnvl_fabric_supported(torch.accelerator.current_device_index())
-            )
-            unsupported = torch.tensor(
-                1 - local_supported, dtype=torch.float32, device=self.device
-            )
-            unsupported = tp.all_reduce(unsupported)
-            if int(unsupported.item()) != 0:
-                raise RuntimeError("cross-node TP is supported only on MNNVL fabric")
-
-            comm_backend = TorchDistBackend(self.group)
-            allocation_bytes = self.num_buffers * max_tokens * hidden_size * 2
-            self._mnnvl_input_handle = McastGPUBuffer(
-                allocation_bytes,
-                self.world_size,
-                self.rank,
-                self.device,
-                comm_backend,
-            )
-            self._mnnvl_output_handle = McastGPUBuffer(
-                allocation_bytes,
-                self.world_size,
-                self.rank,
-                self.device,
-                comm_backend,
-            )
-            self.input_peer_ptrs = self._mnnvl_input_handle.get_buffer_ptrs_dev()
-            self.output_peer_ptrs = self._mnnvl_output_handle.get_buffer_ptrs_dev()
-            self._initialize_mnnvl_buffers()
-            logger.info("using FlashInfer fabric-mapped MNNVL Lamport buffers")
-        else:
-            self.buf_in = symm_mem.empty(
-                self.num_buffers,
-                max_tokens,
-                self.world_size,
-                self.shard_size,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            self.buf_out = symm_mem.empty(
-                self.num_buffers,
-                max_tokens,
-                hidden_size,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            group_name = self.group.group_name
-            input_handle = symm_mem.rendezvous(self.buf_in, group_name)
-            output_handle = symm_mem.rendezvous(self.buf_out, group_name)
-            self.input_peer_ptrs = input_handle.buffer_ptrs_dev
-            self.output_peer_ptrs = output_handle.buffer_ptrs_dev
-            self._input_handle = input_handle
-            self._output_handle = output_handle
-            self._initialize_lamport_buffers()
+        self.buf_in = symm_mem.empty(
+            self.num_buffers,
+            max_tokens,
+            self.world_size,
+            self.shard_size,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self.buf_out = symm_mem.empty(
+            self.num_buffers,
+            max_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        group_name = self.group.group_name
+        input_handle = symm_mem.rendezvous(self.buf_in, group_name)
+        output_handle = symm_mem.rendezvous(self.buf_out, group_name)
+        self.input_peer_ptrs = input_handle.buffer_ptrs_dev
+        self.output_peer_ptrs = output_handle.buffer_ptrs_dev
+        self._input_handle = input_handle
+        self._output_handle = output_handle
+        self._initialize_lamport_buffers()
         self.generation = 0
+
+        # Diagnostic: LAMPORT_MAX_SPINS>0 bounds the Lamport spin so a starved
+        # waiter reports which peer's partial never arrived, instead of hanging
+        # the stream and stalling every later collective on it. 0 = production
+        # behaviour (unbounded).
+        self.max_spins = int(os.environ.get("LAMPORT_MAX_SPINS", "0"))
+        self._spin_limit = self.max_spins if self.max_spins else (1 << 40)
+        # [0]=input stalls, [1]=output stalls, [2]=max pending pairs,
+        # [3]=first token, [4]=max split, [8+i]=pending pairs from source i.
+        self.stall = torch.zeros(8 + self.world_size, dtype=torch.int32, device=self.device)
+        self.stall[3] = 2**30
+
 
     def usable(self, num_tokens: int) -> bool:
         return 0 < num_tokens <= self.max_tokens
@@ -595,6 +628,7 @@ class LamportRSConv:
         off_s: int,
         ws: int,
         block_size: int,
+        shared_tensor: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Return ``(normed | None, new_residual)``, both shaped ``[T, 6144]``."""
         tokens, hidden_size = residual.shape
@@ -608,6 +642,13 @@ class LamportRSConv:
             or input_tensor.stride(1) != 1
         ):
             raise ValueError("input_tensor must be channel-contiguous bf16 [T, 6144]")
+        if shared_tensor is not None and (
+            shared_tensor.shape != input_tensor.shape
+            or shared_tensor.dtype != input_tensor.dtype
+            or shared_tensor.device != input_tensor.device
+            or shared_tensor.stride(1) != 1
+        ):
+            raise ValueError("shared_tensor must match input_tensor")
         shard_size = hidden_size // self.world_size
         if conv_weight.shape != (shard_size, self.window_size):
             raise ValueError(
@@ -628,6 +669,24 @@ class LamportRSConv:
             raise ValueError("cache head layout is inconsistent with ws")
         if off_s < 0 or off_s + ws > cache.shape[3]:
             raise ValueError("cache channel offset is out of bounds")
+        if block_size != cache.shape[2]:
+            # slot // block_size indexes the block dimension, so a block_size
+            # that disagrees with the cache's own page size walks off the
+            # allocation and faults the GPU instead of raising here. Pass
+            # owner.cache_block_size, not owner.block_size (the conv window).
+            raise ValueError(
+                f"block_size {block_size} does not match the cache page size "
+                f"{cache.shape[2]}; slot indexing would leave the allocation"
+            )
+
+        # The NVIDIA publish kernel folds shared_tensor in via HAS_SHARED,
+        # accumulating in fp32 before the bf16 store. The ROCm kernel has no
+        # such path, so materialize the same sum up front -- identical numerics,
+        # at the cost of one extra elementwise pass.
+        if shared_tensor is not None:
+            input_tensor = (
+                input_tensor.to(torch.float32) + shared_tensor.to(torch.float32)
+            ).to(torch.bfloat16)
 
         index = self.generation
         input_offset = index * self.input_generation_bytes // 4
@@ -657,13 +716,15 @@ class LamportRSConv:
             SPLITS=phase_splits,
             RANK=self.rank,
             WORLD=self.world_size,
-            USE_PDL=self.use_pdl,
-            launch_pdl=self.use_pdl,
+            USE_PDL=False,
+            launch_pdl=False,
             num_warps=phase_warps,
         )
         _reduce_insert_kernel[phase_grid](
             self.input_peer_ptrs,
             input_offset,
+            self._spin_limit,
+            self.stall,
             cache,
             slot_mapping,
             cache.stride(0),
@@ -679,8 +740,9 @@ class LamportRSConv:
             CACHE_OFFSET=off_s,
             RANK=self.rank,
             WORLD=self.world_size,
-            USE_PDL=self.use_pdl,
-            launch_pdl=self.use_pdl,
+            BOUNDED=self.max_spins > 0,
+            USE_PDL=False,
+            launch_pdl=False,
             num_warps=phase_warps,
         )
         _sconv_publish_kernel[phase_grid](
@@ -710,11 +772,13 @@ class LamportRSConv:
             RANK=self.rank,
             WORLD=self.world_size,
             WINDOW=self.window_size,
-            USE_PDL=self.use_pdl,
-            launch_pdl=self.use_pdl,
+            USE_PDL=False,
+            launch_pdl=False,
             num_warps=phase_warps,
         )
         _gather_norm_kernel[(tokens,)](
+            self._spin_limit,
+            self.stall,
             self.output_peer_ptrs,
             output_offset,
             norm_weight if norm_weight is not None else residual,
@@ -726,11 +790,33 @@ class LamportRSConv:
             C_P2=triton.next_power_of_2(hidden_size),
             RANK=self.rank,
             HAS_NORM=norm_weight is not None,
-            USE_PDL=self.use_pdl,
-            launch_pdl=self.use_pdl,
+            BOUNDED=self.max_spins > 0,
+            USE_PDL=False,
+            launch_pdl=False,
             num_warps=gather_warps,
         )
         self.generation = (index + 1) % self.num_buffers
+
+        if self.max_spins:
+            # Forces a sync, so this is diagnostic-only. Without it a starved
+            # waiter is invisible: the stream never drains and the failure
+            # surfaces much later as an unrelated NCCL collective timeout.
+            counts = self.stall.tolist()
+            if counts[0] or counts[1]:
+                per_source = ", ".join(
+                    f"rank{i}:{n}" for i, n in enumerate(counts[8:]) if n
+                )
+                self.stall.zero_()
+                self.stall[3] = 2**30
+                raise RuntimeError(
+                    f"Lamport spin-wait starved on rank {self.rank} after "
+                    f"{self.max_spins} spins: {counts[0]} input-phase and "
+                    f"{counts[1]} output-phase CTAs gave up; worst CTA still "
+                    f"missing {counts[2]} pairs at token {counts[3]} split "
+                    f"{counts[4]}; unpublished partials from [{per_source}] "
+                    f"(tokens={tokens}, splits={phase_splits}, gen={index})"
+                )
+
         return normed, residual_out
 
 
