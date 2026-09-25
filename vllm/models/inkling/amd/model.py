@@ -54,6 +54,7 @@ from .mlp import InklingDenseMLP
 from .moe import InklingMoE
 from .ops.lamport import get_lamport_rs_conv, initialize_lamport_rs_conv
 from .ops.norm import add_rmsnorm, embed_rmsnorm
+from .ops.symm_mem_collectives import get_triton_rs_ag, initialize_triton_rs_ag
 from .sconv_swa_attn import _ATTN, _MLP, InklingConvState, InklingSconvMetadata
 from .short_conv import InklingShortConv
 
@@ -119,6 +120,12 @@ def _sconv_add_norm(
             shared_tensor=shared_delta,
         )
 
+    # Triton symm-mem RS (+shared) -> shard sconv -> AG fused with add(+rmsnorm).
+    rs_ag = get_triton_rs_ag()
+    if rs_ag is not None and rs_ag.usable(delta.shape[0]):
+        shard = rs_ag.reduce_scatter(delta, shared_delta)
+        shard = sconv(shard, positions)
+        return rs_ag.all_gather_add_norm(shard, hidden, norm_w, eps)
 
     # RCCL RS -> shard sconv -> AG -> fused add(+rmsnorm).
     # Mirror the NVIDIA fallback: the fused path folds shared_delta into the
@@ -444,6 +451,14 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
             text_config.sconv_kernel_size,
             vllm_config.scheduler_config.max_num_batched_tokens,
         )
+        if (
+            get_lamport_rs_conv(text_config.hidden_size, text_config.sconv_kernel_size)
+            is None
+        ):
+            initialize_triton_rs_ag(
+                text_config.hidden_size,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+            )
         self.lm_head = ParallelLMHead(
             text_config.padded_vocab_size,
             text_config.hidden_size,
