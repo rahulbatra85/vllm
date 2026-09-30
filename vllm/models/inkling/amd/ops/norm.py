@@ -186,6 +186,96 @@ def add_rmsnorm(
 
 
 @triton.jit
+def _add_rmsnorm_rankmajor_kernel(
+    res_ptr,  # [T, N] residual (read)
+    delta_ptr,  # [world, T, N // world] rank-major all-gather output
+    weight_ptr,
+    y_ptr,  # [T, N] normed output (unused if not HAS_NORM)
+    res_out_ptr,  # [T, N] updated residual output
+    eps,
+    n_rows,
+    res_stride_0,
+    y_stride_0,
+    res_out_stride_0,
+    n_cols,
+    shard_cols: tl.constexpr,
+    block_size_n: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+):
+    # Same flat tile and reduction as _add_rmsnorm_fwd_kernel (bit-identical);
+    # only the delta address differs: column n of row m is at
+    # delta[n // shard_cols, m, n % shard_cols].
+    pid_m = tl.program_id(0).to(tl.int64)
+    offs_n = tl.arange(0, block_size_n)
+    mask_n = offs_n < n_cols
+    rank = offs_n // shard_cols
+    delta_off = (
+        rank.to(tl.int64) * n_rows * shard_cols
+        + pid_m * shard_cols
+        + (offs_n - rank * shard_cols)
+    )
+    r = tl.load(res_ptr + pid_m * res_stride_0 + offs_n, mask=mask_n, other=0.0).to(
+        tl.float32
+    )
+    d = tl.load(delta_ptr + delta_off, mask=mask_n, other=0.0).to(tl.float32)
+    s = (r + d).to(res_out_ptr.dtype.element_ty)
+    tl.store(res_out_ptr + pid_m * res_out_stride_0 + offs_n, s, mask=mask_n)
+    if HAS_NORM:
+        weight = tl.load(weight_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        x = s.to(tl.float32)
+        row_var = tl.sum(x * x, axis=0) / n_cols
+        rstd = tl.math.rsqrt(row_var + eps)
+        tl.store(y_ptr + pid_m * y_stride_0 + offs_n, x * rstd * weight, mask=mask_n)
+
+
+def add_rmsnorm_rankmajor(
+    residual: torch.Tensor,
+    gathered: torch.Tensor,
+    weight: torch.Tensor | None,
+    eps: float,
+    world_size: int,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """``add_rmsnorm`` with ``delta`` given as a dim-0 all-gather of hidden shards.
+
+    ``gathered`` is ``[world_size * T, N // world_size]`` in rank-major order,
+    exactly as ``all_gather_into_tensor`` returns it, so the interleave back to
+    ``[T, N]`` is folded into the loads instead of materialized. Returns
+    ``(y | None, res)``; ``weight=None`` only adds (no norm).
+    """
+    n_rows, n_cols = residual.shape
+    shard_cols = n_cols // world_size
+    assert gathered.shape == (world_size * n_rows, shard_cols), gathered.shape
+    assert gathered.is_contiguous() and residual.stride(1) == 1
+    res_out = torch.empty_like(residual)
+    y = torch.empty_like(residual) if weight is not None else None
+    if n_rows == 0:
+        return y, res_out
+
+    block_size_n = triton.next_power_of_2(n_cols)
+    max_block_size_n = _MAX_FUSED_SIZE // residual.element_size()
+    if max_block_size_n < block_size_n:
+        raise RuntimeError(f"Large {n_cols=} is not supported")
+    _add_rmsnorm_rankmajor_kernel[(n_rows,)](
+        residual,
+        gathered,
+        weight if weight is not None else residual,
+        y if y is not None else res_out,
+        res_out,
+        eps,
+        n_rows,
+        residual.stride(0),
+        (y if y is not None else res_out).stride(0),
+        res_out.stride(0),
+        n_cols,
+        shard_cols,
+        block_size_n,
+        HAS_NORM=weight is not None,
+        num_warps=_get_num_warps_from_block_size(block_size_n),
+    )
+    return y, res_out
+
+
+@triton.jit
 def _embed_rmsnorm_kernel(
     ids_ptr,  # [T] token ids
     table_ptr,  # [V, N] embedding table

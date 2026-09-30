@@ -53,7 +53,7 @@ from .logits_processor import InklingLogitsProcessor
 from .mlp import InklingDenseMLP
 from .moe import InklingMoE
 from .ops.lamport import get_lamport_rs_conv, initialize_lamport_rs_conv
-from .ops.norm import add_rmsnorm, embed_rmsnorm
+from .ops.norm import add_rmsnorm_rankmajor, embed_rmsnorm
 from .ops.symm_mem_collectives import get_triton_rs_ag, initialize_triton_rs_ag
 from .sconv_swa_attn import _ATTN, _MLP, InklingConvState, InklingSconvMetadata
 from .short_conv import InklingShortConv
@@ -132,12 +132,16 @@ def _sconv_add_norm(
     # reduced value, so this path has to add it too or it is silently dropped.
     if shared_delta is not None:
         delta.add_(shared_delta)
-    shard = tensor_model_parallel_reduce_scatter(delta, dim=-1)
-    shard = sconv(shard.contiguous(), positions)
-    full = tensor_model_parallel_all_gather(shard, dim=-1)
-    if norm is None:
-        return None, hidden + full
-    return add_rmsnorm(hidden, full, norm_w, eps)
+    # RCCL scatters/gathers contiguous dim-0 chunks. A dim=-1 collective would
+    # transpose the RS output back and interleave the AG output with two extra
+    # copies; instead the sconv reads the [H/tp, T] RS output transposed and the
+    # add+norm reads the rank-major [tp*T, H/tp] AG output directly.
+    shard_ct = tensor_model_parallel_reduce_scatter(delta.t().contiguous(), dim=0)
+    shard = sconv(shard_ct.t(), positions).contiguous()
+    gathered = tensor_model_parallel_all_gather(shard, dim=0)
+    return add_rmsnorm_rankmajor(
+        hidden, gathered, norm_w, eps, get_tensor_model_parallel_world_size()
+    )
 
 
 class InklingDecoderLayer(nn.Module):

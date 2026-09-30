@@ -78,7 +78,8 @@ class InklingShortConv(nn.Module):
         # mappings are built with that enlarged size, so index the bound cache
         # with its runtime token dimension rather than the kernel window size.
         block_size = self.owner.cache_block_size
-        x = x.contiguous()
+        # fused_sconv takes x as-is when channel- or token-contiguous (the RCCL
+        # path passes the reduce-scatter's [dim, T] output transposed).
         weight = self.weight.squeeze(1)  # (dim, W)
 
         return fused_sconv(

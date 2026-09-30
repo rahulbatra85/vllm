@@ -37,6 +37,7 @@ from vllm.distributed import (
 from vllm.model_executor.kernels.linear.cute_dsl import ll_bf16
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.utils import rocm_unquantized_gemm
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
@@ -56,6 +57,18 @@ if TYPE_CHECKING:
 
 _INKLING_LL_BF16_MAX_TOKENS = 64
 _MXFP4_INPUT_SCALE_DENOMINATOR = torch.finfo(torch.float8_e4m3fn).max * 6.0
+
+
+def _aiter_tgemm():
+    """AITER's tuned GEMM dispatcher (its bf16 GEMM table picks the backend per
+    shape), or None when AITER linear GEMMs are disabled."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if not rocm_aiter_ops.is_tgemm_enabled():
+        return None
+    from aiter.tuned_gemm import tgemm
+
+    return tgemm
 
 
 def _linear_with_fp32_out(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -337,10 +350,16 @@ class InklingSinkExperts(nn.Module):
             self._unit = torch.ones(
                 self.n_experts, dtype=torch.float32, device=x.device
             )
-        raw = x @ self.w13_weight.view(-1, x.shape[-1]).T  # (T, S*2F)
+        # Through the ROCm GEMM dispatcher (not a bare matmul) so AITER's tuned
+        # bf16 GEMM table can select the backend for this shape.
+        raw = rocm_unquantized_gemm(
+            self, x, self.w13_weight.view(-1, x.shape[-1])
+        )  # (T, S*2F)
         h = sink_silu_mul_epilogue(
             raw, self._unit, gammas, self._unit, self.n_experts, x.dtype
         )
+        if (tgemm := _aiter_tgemm()) is not None:
+            return tgemm.mm(h, self.w2_weight)  # (T, D)
         return h @ self.w2_weight.T  # (T, D)
 
 

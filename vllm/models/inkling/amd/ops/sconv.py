@@ -34,7 +34,7 @@ from vllm.triton_utils import tl, triton
 
 @triton.jit
 def _fused_sconv_kernel(
-    x_ptr,  # [T, H*WS] head-major current-token inputs (also residual)
+    x_ptr,  # [T, H*WS] head-major current-token inputs (also residual); any strides
     cache_ptr,  # [num_blocks, H, N, D] paged (page-strided view)
     weight_ptr,  # [H*WS, W]
     out_ptr,  # [T, H*WS]
@@ -45,6 +45,8 @@ def _fused_sconv_kernel(
     qstart_ptr,  # [T] int32 first x-row of the token's request
     T,  # num tokens
     stride_x_t,
+    stride_x_c,
+    stride_o_t,
     stride_c_blk,
     stride_c_h,
     stride_c_n,
@@ -86,7 +88,9 @@ def _fused_sconv_kernel(
     tc_mask = t_mask[:, None] & c_mask[None, :]
 
     # 1) Insert each token's input into its paged slot (skip PAD rows).
-    xv = tl.load(x_ptr + toff[:, None] * stride_x_t + coff[None, :], mask=tc_mask)
+    xv = tl.load(
+        x_ptr + toff[:, None] * stride_x_t + coff[None, :] * stride_x_c, mask=tc_mask
+    )
     safe_slot = tl.maximum(slot, 0)
     dst = (
         cache_ptr
@@ -111,7 +115,7 @@ def _fused_sconv_kernel(
         # wrote), so there is no write/read hazard.
         safe_row = tl.maximum(row, 0)
         xt = tl.load(
-            x_ptr + safe_row[:, None] * stride_x_t + coff[None, :],
+            x_ptr + safe_row[:, None] * stride_x_t + coff[None, :] * stride_x_c,
             mask=c_mask[None, :] & intra[:, None],
             other=0.0,
         ).to(tl.float32)
@@ -143,14 +147,14 @@ def _fused_sconv_kernel(
         acc += xv.to(tl.float32)
 
     tl.store(
-        out_ptr + toff[:, None] * stride_x_t + coff[None, :],
+        out_ptr + toff[:, None] * stride_o_t + coff[None, :],
         acc.to(out_ptr.dtype.element_ty),
         mask=tc_mask,
     )
 
 
 def fused_sconv(
-    x: torch.Tensor,  # [T, H*ws] head-major current-token inputs
+    x: torch.Tensor,  # [T, H*ws] head-major inputs; contiguous or a [H*ws, T].t()
     weight: torch.Tensor,  # [H*ws, W]
     cache: torch.Tensor,  # [num_blocks, H, N, D] paged
     positions: torch.Tensor,  # [T] int64 absolute position per token
@@ -171,10 +175,13 @@ def fused_sconv(
     under eager / piecewise / full capture.
     """
     T = x.shape[0]
-    out = torch.empty_like(x)
+    # Channel-contiguous, or the transpose of a contiguous [C, T] buffer (e.g. a
+    # dim-0 reduce-scatter output); anything else is made contiguous.
+    if x.stride(1) != 1 and x.stride(0) != 1:
+        x = x.contiguous()
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if T == 0:
         return out
-    assert x.is_contiguous()
     assert cache.stride(3) == 1, "cache D-dim must be contiguous"
     H = cache.shape[1]
     W = weight.shape[1]
@@ -185,6 +192,10 @@ def fused_sconv(
     # tile at 4 warps measured best on Blackwell; larger tiles spill registers.
     BLOCK_C = min(triton.next_power_of_2(C), 256)
     BT = 8
+    if x.stride(1) != 1:
+        # Token-contiguous input: 64 tokens x 32 channels so each channel's
+        # tokens load as whole cache lines.
+        BT, BLOCK_C = 64, 32
     grid = (triton.cdiv(T, BT), triton.cdiv(C, BLOCK_C))
     _fused_sconv_kernel[grid](
         x,
@@ -198,6 +209,8 @@ def fused_sconv(
         query_start,
         T,
         x.stride(0),
+        x.stride(1),
+        out.stride(0),
         cache.stride(0),
         cache.stride(1),
         cache.stride(2),

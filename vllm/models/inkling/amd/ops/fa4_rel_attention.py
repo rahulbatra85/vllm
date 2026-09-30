@@ -165,22 +165,29 @@ def _inkling_rel_attention_kernel(
     q_head_start = pid_kh * gqa_group_size
     bt_row = block_table_ptr + pid_b * stride_bt_b
 
-    q_block_ptr = tl.make_block_ptr(
-        base=q_ptr + q_start * stride_q_t + q_head_start * stride_q_h,
-        shape=(q_len, gqa_group_size, head_dim),
-        strides=(stride_q_t, stride_q_h, stride_q_d),
-        offsets=(q_block, 0, 0),
-        block_shape=(BLOCK_Q, BLOCK_H, BLOCK_D),
-        order=(2, 1, 0),
-    )
-    q = tl.load(q_block_ptr, boundary_check=(0, 1, 2), padding_option="zero")
-    q = tl.reshape(q, (BLOCK_QH, BLOCK_D))
-
     q_rows = q_block + tl.arange(0, BLOCK_Q)
     q_abs = prefix_len + q_rows
     q_valid = q_rows < q_len
+    off_h = tl.arange(0, BLOCK_H)
     off_d = tl.arange(0, BLOCK_D)
     d_valid = off_d < head_dim
+
+    # [BLOCK_Q, BLOCK_H, BLOCK_D] tile of this KV head's query heads; masked
+    # lanes read as zero (Triton >= 3.9 has no block pointers).
+    qhd_mask = (
+        q_valid[:, None, None]
+        & (off_h[None, :, None] < gqa_group_size)
+        & d_valid[None, None, :]
+    )
+    q = tl.load(
+        q_ptr
+        + (q_start + q_rows[:, None, None]) * stride_q_t
+        + (q_head_start + off_h[None, :, None]) * stride_q_h
+        + off_d[None, None, :] * stride_q_d,
+        mask=qhd_mask,
+        other=0.0,
+    )
+    q = tl.reshape(q, (BLOCK_QH, BLOCK_D))
 
     m_i = tl.full((BLOCK_QH,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_QH,), dtype=tl.float32)
@@ -213,7 +220,6 @@ def _inkling_rel_attention_kernel(
 
         # rel_logits is query- and head-dependent. Expand [Q, K] distance
         # indices across the GQA heads, then flatten to match QK's row order.
-        off_h = tl.arange(0, BLOCK_H)
         rel_dist = dist[:, None, :]
         rel_valid = (
             q_valid[:, None, None]
@@ -265,18 +271,13 @@ def _inkling_rel_attention_kernel(
 
     acc /= l_i[:, None]
     acc = tl.reshape(acc, (BLOCK_Q, BLOCK_H, BLOCK_D))
-    out_block_ptr = tl.make_block_ptr(
-        base=out_ptr + q_start * stride_o_t + q_head_start * stride_o_h,
-        shape=(q_len, gqa_group_size, head_dim),
-        strides=(stride_o_t, stride_o_h, stride_o_d),
-        offsets=(q_block, 0, 0),
-        block_shape=(BLOCK_Q, BLOCK_H, BLOCK_D),
-        order=(2, 1, 0),
-    )
     tl.store(
-        out_block_ptr,
+        out_ptr
+        + (q_start + q_rows[:, None, None]) * stride_o_t
+        + (q_head_start + off_h[None, :, None]) * stride_o_h
+        + off_d[None, None, :] * stride_o_d,
         acc.to(out_ptr.dtype.element_ty),
-        boundary_check=(0, 1, 2),
+        mask=qhd_mask,
     )
 
 
