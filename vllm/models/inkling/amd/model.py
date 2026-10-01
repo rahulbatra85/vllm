@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -64,6 +66,26 @@ def _layer_id(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+_PATH_LOG_DIR = os.environ.get("INKLING_SCONV_PATH_LOG")
+_path_log = None
+_path_seq = 0
+
+
+def _trace_path(path: str, tokens: int, has_meta: bool, prefix: str) -> None:
+    """Debug: per-rank record of which collective path each sconv call takes."""
+    global _path_log, _path_seq
+    if _path_log is None:
+        os.makedirs(_PATH_LOG_DIR, exist_ok=True)
+        rank = get_tensor_model_parallel_rank()
+        # Kept open for the process lifetime; line-buffered so a hang loses nothing.
+        _path_log = open(f"{_PATH_LOG_DIR}/rank{rank}.log", "a", buffering=1)  # noqa: SIM115
+    _path_log.write(
+        f"{_path_seq} {path} T={tokens} meta={int(has_meta)} {prefix} "
+        f"t={time.monotonic():.6f}\n"
+    )
+    _path_seq += 1
+
+
 def _sconv_add_norm(
     delta: torch.Tensor,
     hidden: torch.Tensor,
@@ -96,6 +118,8 @@ def _sconv_add_norm(
 
     mm = get_lamport_rs_conv(hidden.shape[-1], sconv.kernel_size)
     if mm is not None and mm.usable(delta.shape[0]) and m is not None:
+        if _PATH_LOG_DIR:
+            _trace_path("lamport", delta.shape[0], True, sconv.owner.prefix)
         assert cache.numel() > 0
         assert isinstance(m, InklingSconvMetadata)
         return mm.rs_sconv_ag_add_norm(
@@ -123,6 +147,10 @@ def _sconv_add_norm(
     # Triton symm-mem RS (+shared) -> shard sconv -> AG fused with add(+rmsnorm).
     rs_ag = get_triton_rs_ag()
     if rs_ag is not None and rs_ag.usable(delta.shape[0]):
+        if _PATH_LOG_DIR:
+            _trace_path(
+                "triton_rs_ag", delta.shape[0], m is not None, sconv.owner.prefix
+            )
         shard = rs_ag.reduce_scatter(delta, shared_delta)
         shard = sconv(shard, positions)
         return rs_ag.all_gather_add_norm(shard, hidden, norm_w, eps)
@@ -130,6 +158,8 @@ def _sconv_add_norm(
     # RCCL RS -> shard sconv -> AG -> fused add(+rmsnorm).
     # Mirror the NVIDIA fallback: the fused path folds shared_delta into the
     # reduced value, so this path has to add it too or it is silently dropped.
+    if _PATH_LOG_DIR:
+        _trace_path("rccl", delta.shape[0], m is not None, sconv.owner.prefix)
     if shared_delta is not None:
         delta.add_(shared_delta)
     # RCCL scatters/gathers contiguous dim-0 chunks. A dim=-1 collective would

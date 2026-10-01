@@ -56,6 +56,8 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 _MAX_TOKENS = 16384
+# ops/csrc/lamport_p2p.hip:ipc_alloc modes
+_IPC_MODES = {"uncached": 0, "finegrained": 1, "coarse": 2}
 _EMPTY_PAIR = tl.constexpr(0x80008000)
 
 
@@ -573,28 +575,39 @@ class LamportRSConv:
         self.input_generation_bytes = max_tokens * hidden_size * 2
         self.output_generation_bytes = max_tokens * hidden_size * 2
 
-        self.buf_in = symm_mem.empty(
-            self.num_buffers,
-            max_tokens,
-            self.world_size,
-            self.shard_size,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self.buf_out = symm_mem.empty(
-            self.num_buffers,
-            max_tokens,
-            hidden_size,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        group_name = self.group.group_name
-        input_handle = symm_mem.rendezvous(self.buf_in, group_name)
-        output_handle = symm_mem.rendezvous(self.buf_out, group_name)
-        self.input_peer_ptrs = input_handle.buffer_ptrs_dev
-        self.output_peer_ptrs = output_handle.buffer_ptrs_dev
-        self._input_handle = input_handle
-        self._output_handle = output_handle
+        # LAMPORT_MEM=ipc (default) shares hipIpc buffers like vLLM's / aiter's
+        # custom all-reduce; =symm_mem uses PyTorch symmetric memory.
+        self.mem = os.environ.get("LAMPORT_MEM", "ipc")
+        self.ipc_mode = os.environ.get("LAMPORT_IPC_MODE", "uncached")
+        if self.mem not in ("ipc", "symm_mem"):
+            raise ValueError(f"LAMPORT_MEM must be ipc or symm_mem: {self.mem}")
+        if self.ipc_mode not in _IPC_MODES:
+            raise ValueError(f"LAMPORT_IPC_MODE must be one of {list(_IPC_MODES)}")
+        in_shape = (self.num_buffers, max_tokens, self.world_size, self.shard_size)
+        out_shape = (self.num_buffers, max_tokens, hidden_size)
+        self._ipc_local: list[int] = []
+        self._ipc_peers: list[int] = []
+        self._ipc_tables: list[torch.Tensor] = []
+        if self.mem == "ipc":
+            from .lamport_hip import lamport_hip_ops
+
+            self._ext = lamport_hip_ops()
+            self.buf_in, self.input_peer_ptrs = self._ipc_buffer(in_shape)
+            self.buf_out, self.output_peer_ptrs = self._ipc_buffer(out_shape)
+        else:
+            self.buf_in = symm_mem.empty(
+                *in_shape, dtype=torch.bfloat16, device=self.device
+            )
+            self.buf_out = symm_mem.empty(
+                *out_shape, dtype=torch.bfloat16, device=self.device
+            )
+            group_name = self.group.group_name
+            input_handle = symm_mem.rendezvous(self.buf_in, group_name)
+            output_handle = symm_mem.rendezvous(self.buf_out, group_name)
+            self.input_peer_ptrs = input_handle.buffer_ptrs_dev
+            self.output_peer_ptrs = output_handle.buffer_ptrs_dev
+            self._input_handle = input_handle
+            self._output_handle = output_handle
         self._initialize_lamport_buffers()
         self.generation = 0
 
@@ -608,6 +621,69 @@ class LamportRSConv:
         # [3]=first token, [4]=max split, [8+i]=pending pairs from source i.
         self.stall = torch.zeros(8 + self.world_size, dtype=torch.int32, device=self.device)
         self.stall[3] = 2**30
+
+        # LAMPORT_KERNELS=hip (default) runs the four kernels from
+        # csrc/lamport_p2p.hip on the same buffers; =triton uses the Triton ones.
+        # Built here so no compile happens during capture.
+        self.kernels = os.environ.get("LAMPORT_KERNELS", "hip")
+        if self.kernels not in ("triton", "hip"):
+            raise ValueError(f"LAMPORT_KERNELS must be triton or hip: {self.kernels}")
+        self._hip = None
+        if self.kernels == "hip":
+            from .lamport_hip import lamport_hip_ops
+
+            self._hip = lamport_hip_ops()
+        logger.info(
+            "Lamport P2P fused RS/sconv/AG enabled (%s kernels, mem=%s, tp=%d, "
+            "max_tokens=%d)",
+            self.kernels,
+            f"ipc/{self.ipc_mode}" if self.mem == "ipc" else self.mem,
+            self.world_size,
+            max_tokens,
+        )
+
+    def _ipc_buffer(self, shape: tuple[int, ...]) -> tuple[torch.Tensor, int]:
+        """Allocate a hipIpc-shared bf16 buffer.
+
+        Returns the local view and the device address of a uint64 peer-pointer
+        table, the same form as a symm_mem handle's ``buffer_ptrs_dev``.
+        """
+        nbytes = 2
+        for s in shape:
+            nbytes *= s
+        ptr, handle = self._ext.ipc_alloc(nbytes, _IPC_MODES[self.ipc_mode])
+        self._ipc_local.append(ptr)
+        handles: list[torch.Tensor | None] = [None] * self.world_size
+        torch.distributed.all_gather_object(handles, handle, group=self.tp.cpu_group)
+        ptrs = []
+        for r, h in enumerate(handles):
+            if r == self.rank:
+                ptrs.append(ptr)
+            else:
+                ptrs.append(self._ext.ipc_open(h))
+                self._ipc_peers.append(ptrs[-1])
+        local = self._ext.as_tensor(ptr, list(shape), self.device.index)
+        table = torch.tensor(ptrs, dtype=torch.uint64, device=self.device)
+        self._ipc_tables.append(table)
+        return local, table.data_ptr()
+
+    def close(self) -> None:
+        """Release hipIpc buffers (no-op for symmetric memory)."""
+        if not self._ipc_local and not self._ipc_peers:
+            return
+        torch.accelerator.synchronize(self.device)
+        self.buf_in = self.buf_out = None
+        for p in self._ipc_peers:
+            self._ext.ipc_close(p)
+        for p in self._ipc_local:
+            self._ext.ipc_free(p)
+        self._ipc_local, self._ipc_peers = [], []
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
     def usable(self, num_tokens: int) -> bool:
@@ -705,6 +781,30 @@ class LamportRSConv:
         else:
             phase_warps = 4
         gather_warps = 4 if tokens >= 256 else 8
+        if self._hip is not None:
+            hip = self._hip
+            hip.publish_input(
+                input_tensor, self.input_peer_ptrs, input_offset, shard_size,
+                phase_splits, self.rank, self.world_size,
+            )  # fmt: skip
+            hip.reduce_insert(
+                self.input_peer_ptrs, input_offset, self._spin_limit, self.stall, cache,
+                slot_mapping, tokens, block_size, shard_size, phase_splits, ws, off_s,
+                self.rank, self.world_size,
+            )  # fmt: skip
+            hip.sconv_publish(
+                self.output_peer_ptrs, output_offset, residual, conv_weight, cache,
+                positions, seq_idx, slot_mapping, block_table, block_size, shard_size,
+                phase_splits, ws, off_s, self.rank, self.world_size,
+            )  # fmt: skip
+            hip.gather_norm(
+                self.output_peer_ptrs, output_offset, self._spin_limit, self.stall,
+                norm_weight if norm_weight is not None else residual,
+                normed if normed is not None else residual_out, residual_out, eps,
+                self.rank, norm_weight is not None,
+            )  # fmt: skip
+            self.generation = (index + 1) % self.num_buffers
+            return self._check_stalls(tokens, phase_splits, index, normed, residual_out)
         _publish_input_kernel[phase_grid](
             input_tensor,
             self.input_peer_ptrs,
@@ -796,8 +896,16 @@ class LamportRSConv:
             num_warps=gather_warps,
         )
         self.generation = (index + 1) % self.num_buffers
+        return self._check_stalls(tokens, phase_splits, index, normed, residual_out)
 
-        if self.max_spins:
+
+    def _check_stalls(self, tokens, phase_splits, index, normed, residual_out):
+        """Raise (after a sync) if a bounded spin gave up; diagnostic only.
+
+        Skipped while a CUDA graph is being captured (a sync there is illegal);
+        the eager warmup runs before each capture are still checked.
+        """
+        if self.max_spins and not torch.cuda.is_current_stream_capturing():
             # Forces a sync, so this is diagnostic-only. Without it a starved
             # waiter is invisible: the stream never drains and the failure
             # surfaces much later as an unrelated NCCL collective timeout.
